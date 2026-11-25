@@ -1,0 +1,40 @@
+# Build outputs
+bin/
+obj/
+out/
+dist/
+*.dll
+*.exe
+*.pdb
+*.mdb
+*.xml
+!NuGet.config
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+*.DotSettings.user
+
+# Local game & MelonLoader files (never commit proprietary binaries)
+Managed/
+MelonLoader/
+Mods/
+Plugins/
+UserLibs/
+UserData/
+A Township Tale_Data/
+*.assets
+*.resource
+
+# Logs & OS artifacts
+*.log
+Logs/
+TestResults/
+coverage/
+.DS_Store
+Thumbs.db
+desktop.ini
