@@ -5,6 +5,7 @@ using Alta.Intelligence;
 using Alta.Networking;
 using Alta.Networking.Animation;
 using Alta.Pathfinding;
+using HarmonyLib;
 using RagdollLib.API;
 using RagdollLib.Core.Model;
 using RagdollLib.Core.State;
@@ -19,6 +20,19 @@ namespace RagdollLib.Runtime
     /// </summary>
     internal sealed class RagdollController : MonoBehaviour
     {
+        private static readonly AccessTools.FieldRef<Walker, float> WalkerLastPhysicsHeightRef =
+            ResolveWalkerField<float>("lastPhysicsHeight");
+        private static readonly AccessTools.FieldRef<Walker, Vector2> WalkerVelocityXzRef =
+            ResolveWalkerField<Vector2>("velocityXZ");
+        private static readonly AccessTools.FieldRef<Walker, float> WalkerVelocityYRef =
+            ResolveWalkerField<float>("velocityY");
+        private static readonly AccessTools.FieldRef<Walker, float> WalkerLastDeltaRef =
+            ResolveWalkerField<float>("lastDelta");
+        private static readonly AccessTools.FieldRef<Walker, bool> WalkerIsWalkingRef =
+            ResolveWalkerField<bool>("isWalking");
+        private static readonly AccessTools.FieldRef<Walker, bool> WalkerIsPivotingRef =
+            ResolveWalkerField<bool>("isPivoting");
+
         private readonly RagdollStateMachine _stateMachine = new RagdollStateMachine();
 
         private RagdollRigInstance _rig;
@@ -26,6 +40,7 @@ namespace RagdollLib.Runtime
         private bool _isLocalPlayer;
 
         // Cached ATT components on the entity
+        private NetworkEntity _networkEntity;
         private Agent _agent;
         private Walker _walker;
         private Navigator _navigator;
@@ -44,7 +59,9 @@ namespace RagdollLib.Runtime
         private bool _savedWalkerEnabled;
         private bool _savedWalkerGoActive;
         private bool _savedRootRbKinematic;
+        private bool _savedRootRbUseGravity;
         private bool _savedRootRbDetectCollisions;
+        private RigidbodyConstraints _savedRootRbConstraints;
         private bool _savedNetRbSuspended;
         private bool _savedIkControllerEnabled;
         private bool _savedNetIkBodyEnabled;
@@ -55,13 +72,20 @@ namespace RagdollLib.Runtime
         private bool _controllersDisabled;
         private bool _pelvisDetached;
         private bool _isShuttingDown;
+        private Vector3 _preRagdollRootPos;
+        private float _chunkEvalTimer;
 
         private System.Action<RagdollController> _onCleanedUp;
 
         public RagdollState State => _stateMachine.State;
         public bool IsRagdolled => _stateMachine.IsRagdolled;
 
-        public void Initialize(GameObject entityRoot, Transform skeletonScope, bool isPlayerCharacter, bool isLocalPlayer, System.Action<RagdollController> onCleanedUp)
+        public void Initialize(
+            GameObject entityRoot,
+            Transform skeletonScope,
+            bool isPlayerCharacter,
+            bool isLocalPlayer,
+            System.Action<RagdollController> onCleanedUp)
         {
             _isPlayerCharacter = isPlayerCharacter;
             _isLocalPlayer = isLocalPlayer;
@@ -147,6 +171,56 @@ namespace RagdollLib.Runtime
             }
         }
 
+        private void FixedUpdate()
+        {
+            if (_rig == null || _isShuttingDown)
+                return;
+
+            if (_stateMachine.State != RagdollState.ActiveRagdoll && _stateMachine.State != RagdollState.DeadRagdoll)
+                return;
+
+            if (_isLocalPlayer || !_pelvisDetached || _rig.Pelvis.BoneTransform == null)
+                return;
+
+            Vector3 pelvisPos = _rig.Pelvis.BoneTransform.position;
+
+            if (NetworkSceneManager.IsServer)
+            {
+                // Keep root Rigidbody awake and moving to the resting pelvis so
+                // NetworkRigidbody.PrepareForWrite continuously broadcasts true position to clients.
+                Vector3 targetRootPos = new Vector3(pelvisPos.x, pelvisPos.y - _rig.PelvisHeightOffset, pelvisPos.z);
+                if (_rootRigidbody != null)
+                {
+                    _rootRigidbody.MovePosition(targetRootPos);
+                    _rootRigidbody.velocity = Vector3.zero;
+                    _rootRigidbody.angularVelocity = Vector3.zero;
+                    _rootRigidbody.WakeUp();
+                }
+                else
+                {
+                    transform.position = targetRootPos;
+                }
+
+                _chunkEvalTimer += Time.fixedDeltaTime;
+                if (_chunkEvalTimer >= 0.25f)
+                {
+                    _chunkEvalTimer = 0f;
+                    _networkEntity?.EvaluateChunk(false);
+                }
+            }
+            else if ((transform.position - _preRagdollRootPos).sqrMagnitude > 0.04f)
+            {
+                // Gently guide client pelvis toward server-synced root position when diverged > 0.25m
+                Vector3 serverPelvisTarget = transform.position + new Vector3(0f, _rig.PelvisHeightOffset, 0f);
+                Vector3 delta = serverPelvisTarget - pelvisPos;
+                if (delta.sqrMagnitude > 0.0625f && _rig.Pelvis.Body != null && !_rig.Pelvis.Body.isKinematic)
+                {
+                    Vector3 desired = Vector3.ClampMagnitude(delta * 4.0f, 8.0f);
+                    _rig.Pelvis.Body.AddForce(desired - (_rig.Pelvis.Body.velocity * 0.25f), ForceMode.Acceleration);
+                }
+            }
+        }
+
         private void Update()
         {
             if (_rig == null || _isShuttingDown)
@@ -154,17 +228,6 @@ namespace RagdollLib.Runtime
 
             if (_stateMachine.State == RagdollState.ActiveRagdoll || _stateMachine.State == RagdollState.DeadRagdoll)
             {
-                // Keep entity root synchronized with the resting pelvis on non-local rigs so
-                // NetworkRigidbody and chunk proximity match the ragdoll's real-world location.
-                if (!_isLocalPlayer && _pelvisDetached && _rig.Pelvis.BoneTransform != null)
-                {
-                    if (NetworkSceneManager.IsServer)
-                    {
-                        Vector3 targetRootPos = _rig.Pelvis.BoneTransform.position + _rig.PelvisToRootOffset;
-                        transform.position = targetRootPos;
-                    }
-                }
-
                 if (_stateMachine.Tick(Time.deltaTime))
                 {
                     Recover(this);
@@ -188,6 +251,7 @@ namespace RagdollLib.Runtime
 
         private void CacheEntityComponents(GameObject entityRoot, Transform skeletonScope)
         {
+            _networkEntity = entityRoot.GetComponent<NetworkEntity>();
             _agent = entityRoot.GetComponentInChildren<Agent>(true);
             _walker = entityRoot.GetComponentInChildren<Walker>(true);
             _navigator = entityRoot.GetComponentInChildren<Navigator>(true);
@@ -209,6 +273,8 @@ namespace RagdollLib.Runtime
 
         private void EnterRagdollPhysics()
         {
+            _chunkEvalTimer = 0f;
+
             if (!_controllersDisabled)
             {
                 CaptureAndDisableControllers();
@@ -304,9 +370,12 @@ namespace RagdollLib.Runtime
                 _pelvisDetached = false;
             }
 
+            Vector3 recoveredPos = transform.position;
+            bool hasRecoveredPos = false;
             if (performGroundRealign && !_isLocalPlayer && !isDestroying)
             {
-                RealignRootToGround(pelvisWorldPos, pelvisWorldForward);
+                recoveredPos = RealignRootToGround(pelvisWorldPos, pelvisWorldForward);
+                hasRecoveredPos = true;
             }
 
             // Restore original local bone pose before re-enabling Animator
@@ -339,13 +408,15 @@ namespace RagdollLib.Runtime
 
             if (_controllersDisabled)
             {
-                RestoreControllers(isDestroying);
+                RestoreControllers(isDestroying, recoveredPos, hasRecoveredPos);
                 _controllersDisabled = false;
             }
         }
 
         private void CaptureAndDisableControllers()
         {
+            _preRagdollRootPos = transform.position;
+
             if (_agent != null)
             {
                 _savedAgentEnabled = _agent.IsEnabled;
@@ -382,11 +453,26 @@ namespace RagdollLib.Runtime
             if (_rootRigidbody != null)
             {
                 _savedRootRbKinematic = _rootRigidbody.isKinematic;
+                _savedRootRbUseGravity = _rootRigidbody.useGravity;
                 _savedRootRbDetectCollisions = _rootRigidbody.detectCollisions;
+                _savedRootRbConstraints = _rootRigidbody.constraints;
+
                 _rootRigidbody.velocity = Vector3.zero;
                 _rootRigidbody.angularVelocity = Vector3.zero;
-                _rootRigidbody.isKinematic = true;
+                _rootRigidbody.useGravity = false;
                 _rootRigidbody.detectCollisions = false;
+
+                if (NetworkSceneManager.IsServer)
+                {
+                    // Keep non-kinematic and awake on server so NetworkRigidbody.PrepareForWrite syncs MovePosition
+                    _rootRigidbody.isKinematic = false;
+                    _rootRigidbody.constraints = RigidbodyConstraints.FreezeRotation;
+                    _rootRigidbody.WakeUp();
+                }
+                else
+                {
+                    _rootRigidbody.isKinematic = true;
+                }
             }
 
             if (_isPlayerCharacter)
@@ -437,7 +523,7 @@ namespace RagdollLib.Runtime
             }
         }
 
-        private void RestoreControllers(bool isDestroying)
+        private void RestoreControllers(bool isDestroying, Vector3 recoveredPosition, bool hasRecoveredPosition)
         {
             if (_savedAnimatorEnabled != null)
             {
@@ -486,12 +572,18 @@ namespace RagdollLib.Runtime
 
             if (_rootRigidbody != null)
             {
-                _rootRigidbody.isKinematic = _savedRootRbKinematic;
+                _rootRigidbody.useGravity = _savedRootRbUseGravity;
+                _rootRigidbody.constraints = _savedRootRbConstraints;
                 _rootRigidbody.detectCollisions = _savedRootRbDetectCollisions;
-                if (!_savedRootRbKinematic)
+                _rootRigidbody.isKinematic = _savedRootRbKinematic;
+                if (!isDestroying && hasRecoveredPosition)
                 {
+                    _rootRigidbody.position = recoveredPosition;
                     _rootRigidbody.velocity = Vector3.zero;
                     _rootRigidbody.angularVelocity = Vector3.zero;
+                    Physics.SyncTransforms();
+                    if (NetworkSceneManager.IsServer && !_savedRootRbKinematic)
+                        _rootRigidbody.WakeUp();
                 }
             }
 
@@ -502,18 +594,32 @@ namespace RagdollLib.Runtime
 
             if (_walker != null)
             {
-                _walker.enabled = _savedWalkerEnabled;
                 if (!isDestroying && NetworkSceneManager.IsServer)
                 {
                     if (_savedWalkerGoActive && !_walker.gameObject.activeSelf)
                         _walker.gameObject.SetActive(true);
+                    if (hasRecoveredPosition)
+                        ResetWalkerState(recoveredPosition.y);
                     _walker.ClearBlocked();
                 }
+                _walker.enabled = _savedWalkerEnabled;
             }
 
-            if (_navigator != null && !isDestroying && NetworkSceneManager.IsServer)
+            if (!isDestroying && NetworkSceneManager.IsServer)
             {
-                _navigator.ResetPosition();
+                if (hasRecoveredPosition)
+                {
+                    if (_director != null)
+                        _director.TeleportTo(recoveredPosition, true);
+                    else if (_navigator != null)
+                        _navigator.TeleportTo(recoveredPosition, true);
+                }
+                else if (_navigator != null)
+                {
+                    _navigator.ResetPosition();
+                }
+
+                _networkEntity?.EvaluateChunk(false);
             }
 
             if (_agent != null && !isDestroying && NetworkSceneManager.IsServer)
@@ -572,42 +678,90 @@ namespace RagdollLib.Runtime
             }
         }
 
-        private void RealignRootToGround(Vector3 pelvisWorldPos, Vector3 pelvisForward)
+        private Vector3 RealignRootToGround(Vector3 pelvisWorldPos, Vector3 pelvisForward)
         {
             int layerMask = _walker != null && _walker.GroundLayers.value != 0
                 ? _walker.GroundLayers.value
                 : Physics.DefaultRaycastLayers;
 
-            Vector3 rayOrigin = pelvisWorldPos + (Vector3.up * 0.75f);
-            Vector3 targetPos = pelvisWorldPos + _rig.PelvisToRootOffset;
+            // On remote clients, prefer server-synced root X/Z if server moved the entity during ragdoll
+            Vector3 anchorPos = pelvisWorldPos;
+            if (!NetworkSceneManager.IsServer &&
+                (transform.position - _preRagdollRootPos).sqrMagnitude > 0.04f &&
+                (transform.position - pelvisWorldPos).sqrMagnitude < 16f)
+            {
+                anchorPos = new Vector3(transform.position.x, pelvisWorldPos.y, transform.position.z);
+            }
+
+            Vector3 rayOrigin = anchorPos + (Vector3.up * 0.75f);
+            Vector3 targetPos = new Vector3(anchorPos.x, pelvisWorldPos.y - _rig.PelvisHeightOffset, anchorPos.z);
 
             RaycastHit[] hits = Physics.RaycastAll(rayOrigin, Vector3.down, 6.0f, layerMask, QueryTriggerInteraction.Ignore);
             float bestDist = float.MaxValue;
-            bool foundGround = false;
 
             for (int i = 0; i < hits.Length; i++)
             {
                 Collider hitCol = hits[i].collider;
                 if (hitCol == null || hitCol.transform.IsChildOf(transform))
                     continue;
+                if (hitCol.GetComponentInParent<RagdollController>() != null ||
+                    hitCol.GetComponentInParent<PlayerCharacter>() != null)
+                    continue;
 
                 if (hits[i].distance < bestDist)
                 {
                     bestDist = hits[i].distance;
                     targetPos = hits[i].point + new Vector3(0f, 0.05f, 0f);
-                    foundGround = true;
                 }
             }
 
-            if (!foundGround && targetPos.y < pelvisWorldPos.y - 1.5f)
-                targetPos.y = pelvisWorldPos.y;
-
-            transform.position = targetPos;
-
+            Quaternion uprightRot = transform.rotation;
             Vector3 flatForward = new Vector3(pelvisForward.x, 0f, pelvisForward.z);
             if (flatForward.sqrMagnitude > 1e-4f)
+                uprightRot = Quaternion.LookRotation(flatForward.normalized, Vector3.up);
+
+            transform.SetPositionAndRotation(targetPos, uprightRot);
+            if (_rootRigidbody != null)
             {
-                transform.rotation = Quaternion.LookRotation(flatForward.normalized, Vector3.up);
+                _rootRigidbody.position = targetPos;
+                _rootRigidbody.rotation = uprightRot;
+                _rootRigidbody.velocity = Vector3.zero;
+                _rootRigidbody.angularVelocity = Vector3.zero;
+            }
+            Physics.SyncTransforms();
+
+            return targetPos;
+        }
+
+        private void ResetWalkerState(float groundY)
+        {
+            if (_walker == null)
+                return;
+
+            try
+            {
+                if (WalkerLastPhysicsHeightRef != null) WalkerLastPhysicsHeightRef(_walker) = groundY;
+                if (WalkerVelocityXzRef != null) WalkerVelocityXzRef(_walker) = Vector2.zero;
+                if (WalkerVelocityYRef != null) WalkerVelocityYRef(_walker) = 0f;
+                if (WalkerLastDeltaRef != null) WalkerLastDeltaRef(_walker) = 0f;
+                if (WalkerIsWalkingRef != null) WalkerIsWalkingRef(_walker) = false;
+                if (WalkerIsPivotingRef != null) WalkerIsPivotingRef(_walker) = false;
+            }
+            catch
+            {
+                // Ignore if private field layout differs.
+            }
+        }
+
+        private static AccessTools.FieldRef<Walker, T> ResolveWalkerField<T>(string fieldName)
+        {
+            try
+            {
+                return AccessTools.FieldRefAccess<Walker, T>(fieldName);
+            }
+            catch
+            {
+                return null;
             }
         }
     }

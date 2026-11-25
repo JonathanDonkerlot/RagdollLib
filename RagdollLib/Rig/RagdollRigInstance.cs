@@ -13,7 +13,7 @@ namespace RagdollLib.Rig
         public IReadOnlyList<SkinnedMeshRenderer> SkinnedMeshes { get; }
         public bool[] OriginalUpdateWhenOffscreen { get; }
         public bool[] OriginalExternalColliderEnabled { get; }
-        public Vector3 PelvisToRootOffset { get; }
+        public float PelvisHeightOffset { get; }
 
         public RagdollRigInstance(
             RagdollBoneHandle pelvis,
@@ -37,9 +37,9 @@ namespace RagdollLib.Rig
             for (int i = 0; i < externalColliders.Count; i++)
                 OriginalExternalColliderEnabled[i] = externalColliders[i] != null && externalColliders[i].enabled;
 
-            PelvisToRootOffset = entityRoot != null
-                ? entityRoot.position - pelvis.BoneTransform.position
-                : Vector3.zero;
+            PelvisHeightOffset = entityRoot != null
+                ? Mathf.Clamp(pelvis.BoneTransform.position.y - entityRoot.position.y, 0f, 1.5f)
+                : 0f;
         }
 
         public RagdollBoneHandle FindClosestBone(Vector3 worldPoint)
